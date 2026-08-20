@@ -21,6 +21,13 @@ import semantic_version as sv
 
 from agent.base import Base
 from agent.build_utils.validations import check_python_syntax, get_package_manager_files
+from agent.docker_registry import (
+    ensure_ecr_repository,
+    get_ecr_region,
+    get_ecr_repository_name,
+    is_ecr_registry,
+    login_to_ecr_registry,
+)
 from agent.exceptions import AgentException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.utils import is_registry_healthy
@@ -664,22 +671,21 @@ class ImageBuilder(Base, JobMixin):
     @step("Push Docker Image")
     def _push_docker_image(self):
         max_retries = 3
+        if is_ecr_registry(self.registry["url"]):
+            self._prepare_ecr_push()
+
         environment = os.environ.copy()
         client = docker.from_env(environment=environment, timeout=5 * 60)
 
         for attempt in range(max_retries):
             self.output["push"].append({"id": "Retry", "output": "", "status": f"Success {attempt}"})
             try:
-                if not is_registry_healthy(
-                    self.registry["url"], self.registry["username"], self.registry["password"]
-                ):
+                if not self._registry_is_healthy():
                     raise RegistryDownException("Registry is currently down")
 
                 self._push_image(client)
 
-                if not is_registry_healthy(
-                    self.registry["url"], self.registry["username"], self.registry["password"]
-                ):
+                if not self._registry_is_healthy():
                     raise RegistryDownException("Registry became unhealthy after push")
 
                 return self.output["push"]
@@ -697,18 +703,41 @@ class ImageBuilder(Base, JobMixin):
 
         return None
 
+    def _prepare_ecr_push(self):
+        region = get_ecr_region(self.registry)
+        login_to_ecr_registry(self.registry["url"], region)
+        repository = get_ecr_repository_name(self.image_repository, self.registry["url"])
+        if ensure_ecr_repository(repository, region):
+            self.output["push"].append(
+                {
+                    "id": repository,
+                    "output": "",
+                    "status": "Created ECR repository",
+                }
+            )
+            self._publish_throttled_output(False)
+
+    def _registry_is_healthy(self) -> bool:
+        if is_ecr_registry(self.registry["url"]):
+            return True
+        return is_registry_healthy(self.registry["url"], self.registry["username"], self.registry["password"])
+
     def _push_image(self, client):
-        auth_config = {
-            "username": self.registry["username"],
-            "password": self.registry["password"],
-            "serveraddress": self.registry["url"],
+        push_options = {
+            "stream": True,
+            "decode": True,
         }
+        if not is_ecr_registry(self.registry["url"]):
+            push_options["auth_config"] = {
+                "username": self.registry["username"],
+                "password": self.registry["password"],
+                "serveraddress": self.registry["url"],
+            }
+
         for line in client.images.push(
             self.image_repository,
             self.image_tag,
-            stream=True,
-            decode=True,
-            auth_config=auth_config,
+            **push_options,
         ):
             self.output["push"].append(line)
             self._publish_throttled_output(False)
@@ -810,12 +839,15 @@ class PatchImageBuilder(Base, JobMixin):
     @step("Start Base Container")
     def _start_base_container(self):
         """Docker login and pull base image"""
-        self.execute(
-            f"docker login "
-            f"-u {self.registry['username']} "
-            f"-p {self.registry['password']} "
-            f"{self.registry['url']}"
-        )
+        if is_ecr_registry(self.registry["url"]):
+            login_to_ecr_registry(self.registry["url"], get_ecr_region(self.registry))
+        else:
+            self.execute(
+                f"docker login "
+                f"-u {self.registry['username']} "
+                f"-p {self.registry['password']} "
+                f"{self.registry['url']}"
+            )
         self.execute(f"docker pull {self.base_image}")
         self.execute(f"docker run -d --name {self.container_name} {self.base_image} tail -f /dev/null")
 
@@ -895,19 +927,36 @@ class PatchImageBuilder(Base, JobMixin):
 
     @step("Push Docker Image")
     def _push_patch_image(self):
+        is_ecr = is_ecr_registry(self.registry["url"])
+        if is_ecr:
+            region = get_ecr_region(self.registry)
+            repository = get_ecr_repository_name(self.image_repository, self.registry["url"])
+            if ensure_ecr_repository(repository, region):
+                self.output["push"].append(
+                    {
+                        "id": repository,
+                        "output": "",
+                        "status": "Created ECR repository",
+                    }
+                )
+
         environment = os.environ.copy()
         client = docker.from_env(environment=environment, timeout=5 * 60)
-        auth_config = {
-            "username": self.registry["username"],
-            "password": self.registry["password"],
-            "serveraddress": self.registry["url"],
+        push_options = {
+            "stream": True,
+            "decode": True,
         }
+        if not is_ecr:
+            push_options["auth_config"] = {
+                "username": self.registry["username"],
+                "password": self.registry["password"],
+                "serveraddress": self.registry["url"],
+            }
+
         for line in client.images.push(
             self.image_repository,
             self.image_tag,
-            stream=True,
-            decode=True,
-            auth_config=auth_config,
+            **push_options,
         ):
             self.output["push"].append(line)
             self._publish_throttled_output(False)
