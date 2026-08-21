@@ -21,13 +21,6 @@ import semantic_version as sv
 
 from agent.base import Base
 from agent.build_utils.validations import check_python_syntax, get_package_manager_files
-from agent.docker_registry import (
-    ensure_ecr_repository,
-    get_ecr_region,
-    get_ecr_repository_name,
-    is_ecr_registry,
-    login_to_ecr_registry,
-)
 from agent.exceptions import AgentException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.utils import is_registry_healthy
@@ -671,21 +664,28 @@ class ImageBuilder(Base, JobMixin):
     @step("Push Docker Image")
     def _push_docker_image(self):
         max_retries = 3
-        if is_ecr_registry(self.registry["url"]):
-            self._prepare_ecr_push()
-
         environment = os.environ.copy()
         client = docker.from_env(environment=environment, timeout=5 * 60)
 
         for attempt in range(max_retries):
             self.output["push"].append({"id": "Retry", "output": "", "status": f"Success {attempt}"})
             try:
-                if not self._registry_is_healthy():
+                if not is_registry_healthy(
+                    self.registry["url"], self.registry["username"], self.registry["password"]
+                ):
                     raise RegistryDownException("Registry is currently down")
+
+                # Login to AWS ECR before pushing
+                self._docker_login_ecr()
+
+                # Ensure ECR repository exists before pushing
+                self._ensure_ecr_repository_exists()
 
                 self._push_image(client)
 
-                if not self._registry_is_healthy():
+                if not is_registry_healthy(
+                    self.registry["url"], self.registry["username"], self.registry["password"]
+                ):
                     raise RegistryDownException("Registry became unhealthy after push")
 
                 return self.output["push"]
@@ -703,44 +703,108 @@ class ImageBuilder(Base, JobMixin):
 
         return None
 
-    def _prepare_ecr_push(self):
-        region = get_ecr_region(self.registry)
-        login_to_ecr_registry(self.registry["url"], region)
-        repository = get_ecr_repository_name(self.image_repository, self.registry["url"])
-        if ensure_ecr_repository(repository, region):
-            self.output["push"].append(
-                {
-                    "id": repository,
-                    "output": "",
-                    "status": "Created ECR repository",
-                }
-            )
-            self._publish_throttled_output(False)
+    def _docker_login_ecr(self):
+        """Login to AWS ECR using AWS CLI to get a fresh token"""
+        url = self.registry["url"]
 
-    def _registry_is_healthy(self) -> bool:
-        if is_ecr_registry(self.registry["url"]):
-            return True
-        return is_registry_healthy(self.registry["url"], self.registry["username"], self.registry["password"])
+        # Extract the region from an ECR registry URL.
+        # Expected format:
+        # account-id.dkr.ecr.region.amazonaws.com
+        region = "us-west-1"
+        if "ecr" in url and "amazonaws.com" in url:
+            parts = url.split(".")
+            if len(parts) >= 4:
+                region = parts[3]
+
+        command = (
+            f"aws ecr get-login-password --region {region} "
+            f"| docker login --username AWS --password-stdin {url}"
+        )
+        result = subprocess.run(
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if result.returncode != 0:
+            raise Exception(f"ECR login failed: {result.stderr}")
+
+        return result.stdout
+
+    def _ensure_ecr_repository_exists(self):
+        """Ensure the ECR repository exists, create it if it doesn't"""
+        url = self.registry["url"]
+
+        # Extract the region from an ECR registry URL.
+        region = "us-west-1"
+        if "ecr" in url and "amazonaws.com" in url:
+            parts = url.split(".")
+            if len(parts) >= 4:
+                region = parts[3]
+
+        # Expected image_repository format:
+        # account-id.dkr.ecr.region.amazonaws.com/repository-name
+        repo_name = (
+            self.image_repository.split("/", 1)[1]
+            if "/" in self.image_repository
+            else self.image_repository
+        )
+
+        check_command = (
+            f"aws ecr describe-repositories "
+            f"--repository-names {repo_name} --region {region}"
+        )
+        check_result = subprocess.run(
+            check_command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+        if check_result.returncode != 0:
+            if "RepositoryNotFoundException" in check_result.stderr:
+                create_command = (
+                    f"aws ecr create-repository "
+                    f"--repository-name {repo_name} --region {region}"
+                )
+                create_result = subprocess.run(
+                    create_command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+
+                if create_result.returncode != 0:
+                    raise Exception(
+                        f"Failed to create ECR repository: {create_result.stderr}"
+                    )
+
+                self.output["push"].append(
+                    {
+                        "id": "repository",
+                        "status": f"Created ECR repository: {repo_name}",
+                    }
+                )
+            else:
+                raise Exception(
+                    f"Failed to check ECR repository: {check_result.stderr}"
+                )
 
     def _push_image(self, client):
-        push_options = {
-            "stream": True,
-            "decode": True,
-        }
-        if not is_ecr_registry(self.registry["url"]):
-            push_options["auth_config"] = {
-                "username": self.registry["username"],
-                "password": self.registry["password"],
-                "serveraddress": self.registry["url"],
-            }
-
         for line in client.images.push(
             self.image_repository,
             self.image_tag,
-            **push_options,
+            stream=True,
+            decode=True,
         ):
             self.output["push"].append(line)
             self._publish_throttled_output(False)
+
+        self._publish_throttled_output(True)
 
     def _publish_throttled_output(self, flush: bool):
         if flush:
@@ -839,15 +903,12 @@ class PatchImageBuilder(Base, JobMixin):
     @step("Start Base Container")
     def _start_base_container(self):
         """Docker login and pull base image"""
-        if is_ecr_registry(self.registry["url"]):
-            login_to_ecr_registry(self.registry["url"], get_ecr_region(self.registry))
-        else:
-            self.execute(
-                f"docker login "
-                f"-u {self.registry['username']} "
-                f"-p {self.registry['password']} "
-                f"{self.registry['url']}"
-            )
+        self.execute(
+            f"docker login "
+            f"-u {self.registry['username']} "
+            f"-p {self.registry['password']} "
+            f"{self.registry['url']}"
+        )
         self.execute(f"docker pull {self.base_image}")
         self.execute(f"docker run -d --name {self.container_name} {self.base_image} tail -f /dev/null")
 
@@ -927,36 +988,19 @@ class PatchImageBuilder(Base, JobMixin):
 
     @step("Push Docker Image")
     def _push_patch_image(self):
-        is_ecr = is_ecr_registry(self.registry["url"])
-        if is_ecr:
-            region = get_ecr_region(self.registry)
-            repository = get_ecr_repository_name(self.image_repository, self.registry["url"])
-            if ensure_ecr_repository(repository, region):
-                self.output["push"].append(
-                    {
-                        "id": repository,
-                        "output": "",
-                        "status": "Created ECR repository",
-                    }
-                )
-
         environment = os.environ.copy()
         client = docker.from_env(environment=environment, timeout=5 * 60)
-        push_options = {
-            "stream": True,
-            "decode": True,
+        auth_config = {
+            "username": self.registry["username"],
+            "password": self.registry["password"],
+            "serveraddress": self.registry["url"],
         }
-        if not is_ecr:
-            push_options["auth_config"] = {
-                "username": self.registry["username"],
-                "password": self.registry["password"],
-                "serveraddress": self.registry["url"],
-            }
-
         for line in client.images.push(
             self.image_repository,
             self.image_tag,
-            **push_options,
+            stream=True,
+            decode=True,
+            auth_config=auth_config,
         ):
             self.output["push"].append(line)
             self._publish_throttled_output(False)

@@ -26,24 +26,12 @@ from agent.application_storage_analyzer import (
 )
 from agent.base import AgentException, Base
 from agent.bench import Bench
-from agent.docker_registry import (
-    ECRRegistryError,
-    get_ecr_region,
-    get_registry_hostname,
-    is_ecr_registry,
-    login_to_ecr_registry,
-)
 from agent.exceptions import BenchNotExistsException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.nfs_handler import NFSHandler
 from agent.patch_handler import run_patches
 from agent.site import Site
-from agent.utils import (
-    end_execution,
-    get_execution_result,
-    get_supervisor_processes_status,
-    is_registry_healthy,
-)
+from agent.utils import get_supervisor_processes_status, is_registry_healthy
 
 
 class Server(Base):
@@ -71,30 +59,14 @@ class Server(Base):
         return self.config.get("press_url", "https://frappecloud.com")
 
     def docker_login(self, registry):
-        if is_ecr_registry(registry["url"]):
-            region = get_ecr_region(registry)
-            return self._docker_login_to_ecr(registry["url"], region)
-
-        url = shlex.quote(registry["url"])
-        username = shlex.quote(registry["username"])
-        password = shlex.quote(registry["password"])
-        return self.execute(f"docker login -u {username} -p {password} {url}")
-
-    def _docker_login_to_ecr(self, registry_url: str, region: str):
-        hostname = get_registry_hostname(registry_url)
-        command = f"docker login --username AWS --password-stdin {hostname}"
-        result = get_execution_result(command=command, directory=self.directory)
-        try:
-            output = login_to_ecr_registry(registry_url, region)
-        except ECRRegistryError as e:
-            result["returncode"] = 1
-            result["traceback"] = str(e)
-            self.data = end_execution(result, status="Failure")
-            raise
-
-        result["returncode"] = 0
-        self.data = end_execution(result, output=output)
-        return self.data
+        url = registry["url"]
+        username = registry["username"]
+        password = registry["password"]
+        command = (
+            "aws ecr get-login-password --region us-west-1 "
+            f"| docker login --username AWS --password-stdin {url}"
+        )
+        return self.execute(command)
 
     def docker_inspect_manifest(self, image_tag: str):
         try:
@@ -106,9 +78,6 @@ class Server(Base):
 
     def establish_connection_with_registry(self, max_retries: int, registry: dict[str, str]):
         """Given the attempt count try and establish connection with the registry else Raise"""
-        if is_ecr_registry(registry["url"]):
-            return
-
         for attempt in range(max_retries):
             try:
                 if not is_registry_healthy(registry["url"], registry["username"], registry["password"]):
