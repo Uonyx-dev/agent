@@ -528,6 +528,7 @@ class ImageBuilder(Base, JobMixin):
         build_name: str,
         deploy_candidate_params: dict,
         ssh_keys: dict | None = None,
+        filename: str | None = None,
     ) -> None:
         super().__init__()
 
@@ -535,28 +536,39 @@ class ImageBuilder(Base, JobMixin):
         self.image_repository = image_repository
         self.image_tag = image_tag
         self.registry = registry
-        if platform not in ("arm64", "x86_64"):
+        if filename:
+            platform = {"x86_64": "linux/amd64", "arm64": "linux/arm64"}.get(platform, platform)
+        allowed_platforms = ("linux/amd64", "linux/arm64") if filename else ("arm64", "x86_64")
+        if platform not in allowed_platforms:
             raise ValueError(f"Invalid platform '{platform}'")
         self.platform = platform
 
-        self._job_context = JobContext()
+        self.filename = filename
+        self.legacy_context_filepath = (
+            os.path.join(get_image_build_context_directory(), filename) if filename else None
+        )
 
-        self.context_manager = ContextManager(
-            clone_instructions=clone_instructions,
-            build_name=build_name,
-            group=group,
-            dockerfile=dockerfile,
-            deploy_candidate_params=deploy_candidate_params,
-            platform=platform,
-            ssh_keys=ssh_keys,
-            _job_context=self._job_context,
-        )
-        self.build_directory = self.context_manager.build_directory
-        self.validation_manager = ValidationManager(
-            _job_context=self._job_context,
-            dependencies=deploy_candidate_params.get("dependencies"),
-            clone_instructions=clone_instructions,
-        )
+        self._job_context = JobContext()
+        self.context_manager = None
+        self.validation_manager = None
+        self.build_directory = None
+        if not filename:
+            self.context_manager = ContextManager(
+                clone_instructions=clone_instructions,
+                build_name=build_name,
+                group=group,
+                dockerfile=dockerfile,
+                deploy_candidate_params=deploy_candidate_params,
+                platform=platform,
+                ssh_keys=ssh_keys,
+                _job_context=self._job_context,
+            )
+            self.build_directory = self.context_manager.build_directory
+            self.validation_manager = ValidationManager(
+                _job_context=self._job_context,
+                dependencies=deploy_candidate_params.get("dependencies"),
+                clone_instructions=clone_instructions,
+            )
 
         self.no_cache = no_cache
         self.no_push = no_push
@@ -584,6 +596,12 @@ class ImageBuilder(Base, JobMixin):
 
     @job("Run Remote Builder")
     def run_remote_builder(self):
+        if self.legacy_context_filepath:
+            try:
+                return self._build_and_push(self.legacy_context_filepath)
+            finally:
+                self._cleanup_context(self.legacy_context_filepath)
+
         self.context_manager.clone_repositories()
         self.context_manager.prepare_build_context()
         self.validation_manager.validate(
@@ -853,13 +871,19 @@ class ImageBuilder(Base, JobMixin):
 
     @step("Cleanup Context")
     def _cleanup_context(self, context_tar_filepath: str):
-        if os.path.exists(self.build_directory):
+        if self.build_directory and os.path.exists(self.build_directory):
             shutil.rmtree(self.build_directory, ignore_errors=True)
 
         if os.path.exists(context_tar_filepath):
             os.remove(context_tar_filepath)
 
         return {"cleanup": True}
+
+
+def get_image_build_context_directory() -> str:
+    path = os.path.join(os.getcwd(), "build_context")
+    os.makedirs(path, exist_ok=True)
+    return path
 
 
 class PatchImageBuilder(Base, JobMixin):
