@@ -2,6 +2,11 @@ map $host $subdomain_map {
     ~^(?<subdomain>[^.]*).*$ $subdomain.{{ domain }};
 }
 
+map $http_x_forwarded_proto $proxy_forwarded_proto {
+	default $http_x_forwarded_proto;
+	"" $scheme;
+}
+
 {% for name, upstream in upstreams.items() %}
 upstream {{ upstream["hash"] }} {
 	server {{ name }}:80;
@@ -108,6 +113,7 @@ proxy_cache_path /tmp/cache keys_zone=proxy_cache_zone:10m loader_threshold=300 
 {% set ns = namespace(host=host, cert_host=host) %}
 
 server {
+	listen 80{% if ns.host.strip("*.") == domain %} default_server{% endif %};
 	listen 443 http2 ssl{% if ns.host.strip("*.") == domain %} default_server{% endif %};
 	server_name {{ ns.host }};
 
@@ -146,6 +152,10 @@ server {
 	more_set_headers "Referrer-Policy: no-referrer-when-downgrade";
 	more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";
 
+	location = /health {
+		return 200 "OK";
+	}
+
 	{% if host_options.redirect %}
 
 	location / {
@@ -157,15 +167,15 @@ server {
 		proxy_http_version 1.1;
 
 		proxy_cache proxy_cache_zone;
-		proxy_cache_key $scheme$host$request_uri;
+		proxy_cache_key $proxy_forwarded_proto$host$request_uri;
 		proxy_cache_valid 200 302 2m;
 		proxy_cache_valid 404 1m;
 		proxy_cache_bypass $http_secret_cache_purge;
 
 		proxy_set_header Host $host;
 		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $remote_addr;
-		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $proxy_forwarded_proto;
 		proxy_set_header Connection "";
 
 		more_set_headers "X-Proxy-Upstream: $upstream_server_hash";
@@ -179,8 +189,8 @@ server {
 		proxy_set_header Upgrade $http_upgrade;
 		proxy_set_header Host $host;
 		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $remote_addr;
-		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+		proxy_set_header X-Forwarded-Proto $proxy_forwarded_proto;
 		proxy_set_header Connection "upgrade";
 
 		more_set_headers "X-Proxy-Upstream: $socket_upstream_hash";
@@ -199,9 +209,9 @@ server {
 
 		proxy_set_header Host $host;
 		proxy_set_header X-Real-IP $remote_addr;
-		proxy_set_header X-Forwarded-For $remote_addr;
+		proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
 		proxy_set_header X-Client-Port $remote_port;
-		proxy_set_header X-Forwarded-Proto $scheme;
+		proxy_set_header X-Forwarded-Proto $proxy_forwarded_proto;
 		{% if host_options.codeserver %}
 		proxy_set_header Connection "upgrade";
 		proxy_set_header Upgrade $http_upgrade;
