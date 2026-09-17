@@ -1228,6 +1228,7 @@ class Server(Base):
             "redis_port": self.config["redis_port"],
             "gunicorn_workers": self.config.get("gunicorn_workers", 2),
             "workers": self.config["workers"],
+            "high_workers": self.config.get("high_workers", 1),
             "directory": self.directory,
             "user": self.config["user"],
             "sentry_dsn": self.config.get("sentry_dsn"),
