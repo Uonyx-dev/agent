@@ -21,7 +21,7 @@ import semantic_version as sv
 
 from agent.base import Base
 from agent.build_utils.validations import check_python_syntax, get_package_manager_files
-from agent.exceptions import AgentException, RegistryDownException
+from agent.exceptions import AgentException, ImagePushException, RegistryDownException
 from agent.job import Job, Step, job, step
 from agent.utils import is_registry_healthy
 
@@ -683,7 +683,6 @@ class ImageBuilder(Base, JobMixin):
     def _push_docker_image(self):
         max_retries = 3
         environment = os.environ.copy()
-        client = docker.from_env(environment=environment, timeout=5 * 60)
 
         for attempt in range(max_retries):
             self.output["push"].append({"id": "Retry", "output": "", "status": f"Success {attempt}"})
@@ -698,6 +697,12 @@ class ImageBuilder(Base, JobMixin):
 
                 # Ensure ECR repository exists before pushing
                 self._ensure_ecr_repository_exists()
+
+                # The Docker SDK reads ~/.docker/config.json when the client is
+                # constructed and holds on to those credentials. Building the
+                # client here, after _docker_login_ecr has refreshed the file,
+                # is what makes the push use the token we just minted.
+                client = docker.from_env(environment=environment, timeout=5 * 60)
 
                 self._push_image(client)
 
@@ -714,6 +719,15 @@ class ImageBuilder(Base, JobMixin):
                     raise Exception("Failed to push image after multiple attempts") from e
 
                 self._wait_for_registry_recovery()
+
+            except ImagePushException as e:
+                if attempt == max_retries - 1:
+                    self._publish_throttled_output(True)
+                    raise Exception(f"Failed to push image after multiple attempts: {e.message}") from e
+
+                # Retrying re-runs _docker_login_ecr and rebuilds the client, so
+                # an expired registry token is recovered here instead of failing
+                # the deploy and waiting for someone to trigger a second one.
 
             except Exception:
                 self._publish_throttled_output(True)
@@ -820,6 +834,18 @@ class ImageBuilder(Base, JobMixin):
             decode=True,
         ):
             self.output["push"].append(line)
+
+            # The Docker SDK does not raise when a push is rejected; it reports
+            # the failure as a line in the stream and the generator ends
+            # normally. Without this check the step is recorded as a success
+            # and the image is simply missing from the registry afterwards.
+            if "error" in line or "errorDetail" in line:
+                message = (
+                    line.get("error") or line.get("errorDetail", {}).get("message") or "Unknown error"
+                )
+                self._publish_throttled_output(True)
+                raise ImagePushException(message)
+
             self._publish_throttled_output(False)
 
         self._publish_throttled_output(True)

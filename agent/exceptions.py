@@ -32,3 +32,10 @@ class InvalidSiteConfigException(AgentException):
 class RegistryDownException(Exception):
     def __init__(self, data):
         self.data = data
+
+
+class ImagePushException(Exception):
+    def __init__(self, message):
+        self.message = message
+
+        super().__init__(self.message)
