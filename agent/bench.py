@@ -25,6 +25,7 @@ from agent.app import App
 from agent.base import AgentException, Base
 from agent.exceptions import InvalidSiteConfigException, SiteNotExistsException
 from agent.job import job, step
+from agent.job_purge import WAIT_TIMEOUT_AFTER_PURGE, WAIT_TIMEOUT_WITHOUT_PURGE, purge_was_clean
 from agent.site import Site
 from agent.utils import download_file, end_execution, get_execution_result, get_size
 
@@ -240,7 +241,13 @@ class Bench(Base):
     ):
         site = get_site_from_name(site, new_name, self)
         site.enable_maintenance_mode()
-        site.wait_till_ready()
+        # Jobs queued under the old name are orphaned by the rename anyway, so
+        # clearing them first is safe and keeps the rename from racing a busy
+        # queue (it otherwise fails after 300s on a bench with a deep backlog).
+        purged = site.purge_pending_jobs_if_possible()
+        site.wait_till_ready(
+            WAIT_TIMEOUT_AFTER_PURGE if purge_was_clean(purged) else WAIT_TIMEOUT_WITHOUT_PURGE
+        )
         if config:
             if site.config.get("host_name") == f"https://{site.name}":
                 config.update({"host_name": f"https://{new_name}"})
@@ -388,7 +395,12 @@ class Bench(Base):
         site = Site(name, self)
         site.install_apps(apps)
         site.update_config(config)
-        site.enable_scheduler()
+        # A pooled standby site belongs to nobody yet, so a running scheduler
+        # only fills the bench queue with jobs for it -- and those jobs are
+        # what the claim's Rename Site then has to wait out. It stays off until
+        # rename_site_job turns it on at the end of the claim.
+        if not is_standby_site(name):
+            site.enable_scheduler()
         if create_user and create_user.get("email"):
             site.create_user(
                 create_user.get("email"),
@@ -1373,6 +1385,14 @@ def _should_run_phase(
         return True
 
     return any([PurePath(file).match(s) for s in globs])
+
+
+STANDBY_SITE_PREFIX = "standby-"
+
+
+def is_standby_site(name: str) -> bool:
+    """True for a pooled, not-yet-claimed site (Press names those "standby-<n>")."""
+    return name.startswith(STANDBY_SITE_PREFIX)
 
 
 def get_site_from_name(name: str, new_name: str, bench: Bench):

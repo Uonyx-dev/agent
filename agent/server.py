@@ -28,6 +28,7 @@ from agent.base import AgentException, Base
 from agent.bench import Bench
 from agent.exceptions import BenchNotExistsException, RegistryDownException
 from agent.job import Job, Step, job, step
+from agent.job_purge import WAIT_TIMEOUT_AFTER_PURGE, WAIT_TIMEOUT_WITHOUT_PURGE, purge_was_clean
 from agent.nfs_handler import NFSHandler
 from agent.patch_handler import run_patches
 from agent.site import Site
@@ -60,8 +61,6 @@ class Server(Base):
 
     def docker_login(self, registry):
         url = registry["url"]
-        username = registry["username"]
-        password = registry["password"]
         command = (
             "aws ecr get-login-password --region us-west-1 "
             f"| docker login --username AWS --password-stdin {url}"
@@ -526,7 +525,10 @@ class Server(Base):
         site = Site(name, source)
 
         site.enable_maintenance_mode()
-        site.wait_till_ready()
+        purged = site.purge_pending_jobs_if_possible()
+        site.wait_till_ready(
+            WAIT_TIMEOUT_AFTER_PURGE if purge_was_clean(purged) else WAIT_TIMEOUT_WITHOUT_PURGE
+        )
 
         target = Bench(target, self)
         self.move_site(site, target)
@@ -560,7 +562,10 @@ class Server(Base):
         site = Site(name, source)
 
         site.enable_maintenance_mode()
-        site.wait_till_ready()
+        purged = site.purge_pending_jobs_if_possible()
+        site.wait_till_ready(
+            WAIT_TIMEOUT_AFTER_PURGE if purge_was_clean(purged) else WAIT_TIMEOUT_WITHOUT_PURGE
+        )
 
         if not skip_backups:
             site.clear_backup_directory()

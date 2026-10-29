@@ -19,6 +19,13 @@ import requests
 from agent.base import AgentException, Base
 from agent.database import Database
 from agent.job import job, step
+from agent.job_purge import (
+    DEFAULT_GRACE_SECONDS,
+    PURGE_SCRIPT,
+    WAIT_TIMEOUT_WITHOUT_PURGE,
+    build_purge_command,
+    parse_purge_result,
+)
 from agent.utils import b2mb, compute_file_hash, db_client_cli, db_dump_cli, get_size
 
 if TYPE_CHECKING:
@@ -619,8 +626,7 @@ class Site(Base):
                 # releases it.
                 holder_script = 'exec 3> "$1"; shift; "$@"; rc=$?; exec 3>&-; exit $rc'
                 backup_command = " ".join(
-                    quote(part)
-                    for part in ["bash", "-c", holder_script, "_", backup_path_db, *bench_argv]
+                    quote(part) for part in ["bash", "-c", holder_script, "_", backup_path_db, *bench_argv]
                 )
                 self.bench.docker_execute(backup_command)
             finally:
@@ -691,9 +697,49 @@ class Site(Base):
     def set_admin_password(self, password):
         return self.bench_execute(f"set-admin-password {password}")
 
+    def purge_pending_jobs_if_possible(
+        self, grace_seconds=DEFAULT_GRACE_SECONDS, force_stop_running_jobs=False
+    ) -> dict | None:
+        """Purge, but never fail a job because purging failed.
+
+        The purge is an optimisation: without it the job is exactly as slow as
+        it was before, which is survivable. Aborting a rename or migration that
+        would otherwise have succeeded is not. The step is still recorded as
+        failed so the dashboard shows what happened; only the job carries on.
+        Returns the purge result, or None if the purge did not run.
+        """
+        try:
+            return self.purge_pending_jobs(
+                grace_seconds=grace_seconds, force_stop_running_jobs=force_stop_running_jobs
+            )
+        except Exception:
+            return None
+
+    @step("Purge Pending Jobs")
+    def purge_pending_jobs(self, grace_seconds=DEFAULT_GRACE_SECONDS, force_stop_running_jobs=False):
+        """Clear this site's queued jobs so the job is not stuck behind them.
+
+        Only ever runs after maintenance mode is on, which is what keeps the
+        queue from refilling: it stops the scheduler enqueueing for this site.
+
+        subdir is load-bearing: frappe.init() resolves the site against the
+        working directory, and the script exits with IncorrectSitePath from
+        anywhere else.
+        """
+        result = self.bench.docker_execute(
+            build_purge_command(self.name, grace_seconds, force_stop_running_jobs),
+            input=PURGE_SCRIPT,
+            subdir="sites",
+        )
+        return parse_purge_result(result["output"])
+
     @step("Wait for Enqueued Jobs")
-    def wait_till_ready(self):
-        WAIT_TIMEOUT = 300
+    def wait_till_ready(self, timeout=WAIT_TIMEOUT_WITHOUT_PURGE):
+        # The gate that actually proves the queue is clear. Kept even after a
+        # purge, because the purge cannot be race-free: a job already executing
+        # when it ran can enqueue children afterwards. The default stays at the
+        # original 300s for callers that do not purge first.
+        WAIT_TIMEOUT = timeout
         data = {"tries": []}
         start = time.time()
         is_ready = False
@@ -1279,7 +1325,7 @@ print(">>>" + frappe.session.sid + "<<<")
                         backup_path_private_files=backup_path_private_files,
                         streaming=True,
                     )
-                except AgentException:
+                except AgentException as error:
                     # The in-container backup fails with an opaque SIGPIPE whenever
                     # an rclone reader exits early. Give the reader threads a moment
                     # to record their exit codes, then surface the real cause.
@@ -1307,8 +1353,7 @@ print(">>>" + frappe.session.sid + "<<<")
                         rclone_failures[file] = {"exit": ret, "error": err}
                     if rclone_failures:
                         signal_killed = any(
-                            isinstance(d["exit"], int) and d["exit"] < 0
-                            for d in rclone_failures.values()
+                            isinstance(d["exit"], int) and d["exit"] < 0 for d in rclone_failures.values()
                         )
                         hint = (
                             " (negative exit = killed by a signal, likely OOM/earlyoom)"
@@ -1323,7 +1368,7 @@ print(">>>" + frappe.session.sid + "<<<")
                                     f"Per-file rclone exit code / stderr: {rclone_failures}"
                                 )
                             }
-                        )
+                        ) from error
                     # No genuine rclone failure - the backup failed on its own (any
                     # None readers were just blocked waiting for it). Re-raise the
                     # original AgentException with the real in-container traceback.
@@ -1376,8 +1421,15 @@ print(">>>" + frappe.session.sid + "<<<")
                         with contextlib.suppress(Exception):
                             subprocess.run(
                                 [
-                                    "rclone", "deletefile", *s3_flags,
-                                    "--contimeout", "60s", "--timeout", "60s", "--retries", "1",
+                                    "rclone",
+                                    "deletefile",
+                                    *s3_flags,
+                                    "--contimeout",
+                                    "60s",
+                                    "--timeout",
+                                    "60s",
+                                    "--retries",
+                                    "1",
                                     f":s3:{bucket}/{prefix}/{s3_name}",
                                 ],
                                 env=s3_env,
