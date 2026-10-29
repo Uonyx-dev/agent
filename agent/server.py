@@ -61,8 +61,6 @@ class Server(Base):
 
     def docker_login(self, registry):
         url = registry["url"]
-        username = registry["username"]
-        password = registry["password"]
         command = (
             "aws ecr get-login-password --region us-west-1 "
             f"| docker login --username AWS --password-stdin {url}"

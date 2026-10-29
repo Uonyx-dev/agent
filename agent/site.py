@@ -626,8 +626,7 @@ class Site(Base):
                 # releases it.
                 holder_script = 'exec 3> "$1"; shift; "$@"; rc=$?; exec 3>&-; exit $rc'
                 backup_command = " ".join(
-                    quote(part)
-                    for part in ["bash", "-c", holder_script, "_", backup_path_db, *bench_argv]
+                    quote(part) for part in ["bash", "-c", holder_script, "_", backup_path_db, *bench_argv]
                 )
                 self.bench.docker_execute(backup_command)
             finally:
@@ -1326,7 +1325,7 @@ print(">>>" + frappe.session.sid + "<<<")
                         backup_path_private_files=backup_path_private_files,
                         streaming=True,
                     )
-                except AgentException:
+                except AgentException as error:
                     # The in-container backup fails with an opaque SIGPIPE whenever
                     # an rclone reader exits early. Give the reader threads a moment
                     # to record their exit codes, then surface the real cause.
@@ -1354,8 +1353,7 @@ print(">>>" + frappe.session.sid + "<<<")
                         rclone_failures[file] = {"exit": ret, "error": err}
                     if rclone_failures:
                         signal_killed = any(
-                            isinstance(d["exit"], int) and d["exit"] < 0
-                            for d in rclone_failures.values()
+                            isinstance(d["exit"], int) and d["exit"] < 0 for d in rclone_failures.values()
                         )
                         hint = (
                             " (negative exit = killed by a signal, likely OOM/earlyoom)"
@@ -1370,7 +1368,7 @@ print(">>>" + frappe.session.sid + "<<<")
                                     f"Per-file rclone exit code / stderr: {rclone_failures}"
                                 )
                             }
-                        )
+                        ) from error
                     # No genuine rclone failure - the backup failed on its own (any
                     # None readers were just blocked waiting for it). Re-raise the
                     # original AgentException with the real in-container traceback.
@@ -1423,8 +1421,15 @@ print(">>>" + frappe.session.sid + "<<<")
                         with contextlib.suppress(Exception):
                             subprocess.run(
                                 [
-                                    "rclone", "deletefile", *s3_flags,
-                                    "--contimeout", "60s", "--timeout", "60s", "--retries", "1",
+                                    "rclone",
+                                    "deletefile",
+                                    *s3_flags,
+                                    "--contimeout",
+                                    "60s",
+                                    "--timeout",
+                                    "60s",
+                                    "--retries",
+                                    "1",
                                     f":s3:{bucket}/{prefix}/{s3_name}",
                                 ],
                                 env=s3_env,

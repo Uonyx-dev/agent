@@ -680,7 +680,7 @@ class ImageBuilder(Base, JobMixin):
         time.sleep(60)
 
     @step("Push Docker Image")
-    def _push_docker_image(self):
+    def _push_docker_image(self):  # noqa: C901
         max_retries = 3
         environment = os.environ.copy()
 
@@ -779,15 +779,10 @@ class ImageBuilder(Base, JobMixin):
         # Expected image_repository format:
         # account-id.dkr.ecr.region.amazonaws.com/repository-name
         repo_name = (
-            self.image_repository.split("/", 1)[1]
-            if "/" in self.image_repository
-            else self.image_repository
+            self.image_repository.split("/", 1)[1] if "/" in self.image_repository else self.image_repository
         )
 
-        check_command = (
-            f"aws ecr describe-repositories "
-            f"--repository-names {repo_name} --region {region}"
-        )
+        check_command = f"aws ecr describe-repositories --repository-names {repo_name} --region {region}"
         check_result = subprocess.run(
             check_command,
             shell=True,
@@ -798,10 +793,7 @@ class ImageBuilder(Base, JobMixin):
 
         if check_result.returncode != 0:
             if "RepositoryNotFoundException" in check_result.stderr:
-                create_command = (
-                    f"aws ecr create-repository "
-                    f"--repository-name {repo_name} --region {region}"
-                )
+                create_command = f"aws ecr create-repository --repository-name {repo_name} --region {region}"
                 create_result = subprocess.run(
                     create_command,
                     shell=True,
@@ -811,9 +803,7 @@ class ImageBuilder(Base, JobMixin):
                 )
 
                 if create_result.returncode != 0:
-                    raise Exception(
-                        f"Failed to create ECR repository: {create_result.stderr}"
-                    )
+                    raise Exception(f"Failed to create ECR repository: {create_result.stderr}")
 
                 self.output["push"].append(
                     {
@@ -822,9 +812,7 @@ class ImageBuilder(Base, JobMixin):
                     }
                 )
             else:
-                raise Exception(
-                    f"Failed to check ECR repository: {check_result.stderr}"
-                )
+                raise Exception(f"Failed to check ECR repository: {check_result.stderr}")
 
     def _push_image(self, client):
         for line in client.images.push(
@@ -840,9 +828,7 @@ class ImageBuilder(Base, JobMixin):
             # normally. Without this check the step is recorded as a success
             # and the image is simply missing from the registry afterwards.
             if "error" in line or "errorDetail" in line:
-                message = (
-                    line.get("error") or line.get("errorDetail", {}).get("message") or "Unknown error"
-                )
+                message = line.get("error") or line.get("errorDetail", {}).get("message") or "Unknown error"
                 self._publish_throttled_output(True)
                 raise ImagePushException(message)
 
