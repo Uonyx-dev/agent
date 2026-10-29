@@ -8,9 +8,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from agent.job_purge import (
+    BATCH_SIZE,
     PURGE_SCRIPT,
     RESULT_MARKER,
-    BATCH_SIZE,
     WAIT_TIMEOUT_AFTER_PURGE,
     WAIT_TIMEOUT_WITHOUT_PURGE,
     build_purge_command,
@@ -294,7 +294,9 @@ class TestStandbySites(unittest.TestCase):
 
         source = inspect.getsource(bench_module.Bench.rename_site_job.__wrapped__)
         self.assertIn("site.enable_scheduler()", source)
-        self.assertLess(source.index("site.disable_maintenance_mode()"), source.index("site.enable_scheduler()"))
+        self.assertLess(
+            source.index("site.disable_maintenance_mode()"), source.index("site.enable_scheduler()")
+        )
 
 
 if __name__ == "__main__":
